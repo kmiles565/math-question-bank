@@ -70,6 +70,44 @@ def _create_database(path, question_count=1, image_paths=None, content=None, ans
             )
 
 
+def _create_pre_v8_fingerprint_table(connection, indexes):
+    connection.execute(
+        """
+        CREATE TABLE question_fingerprints (
+            question_id INTEGER NOT NULL,
+            fingerprint_version INTEGER NOT NULL,
+            content_revision_hash VARCHAR(64) NOT NULL DEFAULT '',
+            exact_hash VARCHAR(64) NOT NULL DEFAULT '',
+            critical_math_hash VARCHAR(64) NOT NULL DEFAULT '',
+            answer_hash VARCHAR(64) NOT NULL DEFAULT '',
+            simhash_hex VARCHAR(32) NOT NULL DEFAULT '',
+            token_count INTEGER NOT NULL DEFAULT 0,
+            choice_count INTEGER NOT NULL DEFAULT 0,
+            figure_count INTEGER NOT NULL DEFAULT 0,
+            visible_image_hashes TEXT NOT NULL DEFAULT '[]',
+            tikz_hashes TEXT NOT NULL DEFAULT '[]',
+            band0 INTEGER NOT NULL DEFAULT 0,
+            band1 INTEGER NOT NULL DEFAULT 0,
+            band2 INTEGER NOT NULL DEFAULT 0,
+            band3 INTEGER NOT NULL DEFAULT 0,
+            band4 INTEGER NOT NULL DEFAULT 0,
+            band5 INTEGER NOT NULL DEFAULT 0,
+            band6 INTEGER NOT NULL DEFAULT 0,
+            band7 INTEGER NOT NULL DEFAULT 0,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (question_id, fingerprint_version),
+            FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
+        )
+        """
+    )
+    for index_name, columns in indexes.items():
+        connection.execute(
+            f'CREATE INDEX "{index_name}" ON question_fingerprints '
+            f"({', '.join(columns)})"
+        )
+
+
 def _create_real_wal_sidecar_bytes(path):
     connection = sqlite3.connect(path)
     try:
@@ -158,6 +196,144 @@ def test_backup_verifier_rejects_modified_payload(tmp_path):
 
     with pytest.raises(RuntimeError, match="大小不匹配|校验失败"):
         verify_full_backup(tampered)
+
+
+def test_schema_v6_backup_requires_and_counts_fingerprint_table(tmp_path):
+    from mathbank.db_migrations import V6_QUESTION_FINGERPRINT_INDEXES
+
+    database = tmp_path / "math_question_bank.db"
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    _create_database(database)
+    with _sqlite_connection(database) as connection:
+        connection.execute("PRAGMA user_version=6")
+        _create_pre_v8_fingerprint_table(
+            connection,
+            V6_QUESTION_FINGERPRINT_INDEXES,
+        )
+        connection.execute(
+            "INSERT INTO question_fingerprints (question_id, fingerprint_version) "
+            "VALUES (1, 2)"
+        )
+
+    archive = create_full_backup(
+        output_dir=tmp_path / "snapshots",
+        database_path=database,
+        uploads_dir=uploads,
+        metadata_path=tmp_path / "missing.json",
+        retention=None,
+    )
+    manifest = verify_full_backup(archive)
+
+    assert manifest["database"]["row_counts"]["question_fingerprints"] == 1
+
+
+def test_schema_v7_backup_uses_its_three_column_band_indexes(tmp_path):
+    from mathbank.db_migrations import V7_QUESTION_FINGERPRINT_INDEXES
+
+    database = tmp_path / "math_question_bank.db"
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    _create_database(database)
+    with _sqlite_connection(database) as connection:
+        connection.execute("PRAGMA user_version=7")
+        _create_pre_v8_fingerprint_table(
+            connection,
+            V7_QUESTION_FINGERPRINT_INDEXES,
+        )
+        connection.execute(
+            "INSERT INTO question_fingerprints (question_id, fingerprint_version) "
+            "VALUES (1, 2)"
+        )
+
+    archive = create_full_backup(
+        output_dir=tmp_path / "snapshots",
+        database_path=database,
+        uploads_dir=uploads,
+        metadata_path=tmp_path / "missing.json",
+        retention=None,
+    )
+
+    assert verify_full_backup(archive)["database"]["schema_version"] == 7
+
+
+def test_schema_v6_backup_rejects_missing_fingerprint_table(tmp_path):
+    database = tmp_path / "math_question_bank.db"
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    _create_database(database)
+    with _sqlite_connection(database) as connection:
+        connection.execute("PRAGMA user_version=6")
+
+    with pytest.raises(RuntimeError, match="question_fingerprints"):
+        create_full_backup(
+            output_dir=tmp_path / "snapshots",
+            database_path=database,
+            uploads_dir=uploads,
+            metadata_path=tmp_path / "missing.json",
+            retention=None,
+        )
+
+
+def test_schema_v6_backup_rejects_malformed_fingerprint_table(tmp_path):
+    database = tmp_path / "math_question_bank.db"
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    _create_database(database)
+    with _sqlite_connection(database) as connection:
+        connection.execute("PRAGMA user_version=6")
+        connection.execute(
+            "CREATE TABLE question_fingerprints ("
+            "question_id INTEGER NOT NULL, fingerprint_version INTEGER NOT NULL, "
+            "PRIMARY KEY(question_id, fingerprint_version))"
+        )
+
+    with pytest.raises(RuntimeError, match="缺少核心字段"):
+        create_full_backup(
+            output_dir=tmp_path / "snapshots",
+            database_path=database,
+            uploads_dir=uploads,
+            metadata_path=tmp_path / "missing.json",
+            retention=None,
+        )
+
+
+def test_restore_rejects_future_schema_before_replacing_current_database(tmp_path):
+    from mathbank.db_migrations import LATEST_SCHEMA_VERSION
+
+    future_database = tmp_path / "future.db"
+    current_database = tmp_path / "current.db"
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    _create_database(future_database, content="future")
+    with _sqlite_connection(future_database) as connection:
+        connection.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION + 1}")
+        connection.execute(
+            "CREATE TABLE question_fingerprints ("
+            "question_id INTEGER NOT NULL, fingerprint_version INTEGER NOT NULL, "
+            "PRIMARY KEY(question_id, fingerprint_version))"
+        )
+    archive = create_full_backup(
+        output_dir=tmp_path / "snapshots",
+        database_path=future_database,
+        uploads_dir=uploads,
+        metadata_path=tmp_path / "missing.json",
+        retention=None,
+    )
+    _create_database(current_database, content="current")
+
+    with pytest.raises(RuntimeError, match="高于当前程序支持"):
+        restore_full_backup(
+            archive,
+            database_path=current_database,
+            uploads_dir=uploads,
+            metadata_path=tmp_path / "missing.json",
+            safety_backup_dir=tmp_path / "pre_restore",
+            runtime_lock_path=tmp_path / "runtime.lock",
+        )
+
+    with _sqlite_connection(current_database) as connection:
+        assert connection.execute("SELECT content FROM questions").fetchone()[0] == "current"
 
 
 def test_automatic_backup_skips_when_recent_snapshot_exists(tmp_path, monkeypatch):

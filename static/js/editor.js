@@ -162,6 +162,7 @@ let bankQuestionsRetryTimer = null;
                 category_compulsory: document.getElementById('editCompulsory').value,
                 category_chapter: document.getElementById('editChapter').value,
                 category_knowledge: document.getElementById('editKnowledge').value,
+                related_question_id: document.getElementById('editRelatedQuestion').value,
                 image_paths: JSON.stringify(uploadedImages),
                 tikz_code: TikzState.contentAssets[0] ? TikzState.contentAssets[0].tikz_code : '',
                 tikz_reference_image_path: TikzState.contentAssets[0]
@@ -183,6 +184,7 @@ let bankQuestionsRetryTimer = null;
                 category_compulsory: snapshot.category_compulsory,
                 category_chapter: snapshot.category_chapter,
                 category_knowledge: snapshot.category_knowledge,
+                related_question_id: snapshot.related_question_id || '',
                 image_paths: snapshot.image_paths,
                 tikz_code: snapshot.tikz_code || '',
                 tikz_reference_image_path: snapshot.tikz_reference_image_path || '',
@@ -204,6 +206,7 @@ let bankQuestionsRetryTimer = null;
             const currentComp = document.getElementById('editCompulsory').value;
             const currentChap = document.getElementById('editChapter').value;
             const currentKnow = document.getElementById('editKnowledge').value;
+            const currentRelatedQuestionId = document.getElementById('editRelatedQuestion').value;
             const currentImages = JSON.stringify(uploadedImages);
             const currentTikzCode = TikzState.contentAssets[0]
                 ? TikzState.contentAssets[0].tikz_code
@@ -224,6 +227,7 @@ let bankQuestionsRetryTimer = null;
                    currentComp === snapshot.category_compulsory &&
                    currentChap === snapshot.category_chapter &&
                    currentKnow === snapshot.category_knowledge &&
+                   currentRelatedQuestionId === (snapshot.related_question_id || '') &&
                    currentImages === snapshot.image_paths &&
                    currentTikzCode === (snapshot.tikz_code || '') &&
                    currentTikzReferencePath === (snapshot.tikz_reference_image_path || '') &&
@@ -1604,37 +1608,8 @@ let bankQuestionsRetryTimer = null;
                     return;
                 }
                 
-                // Formatted content (standard Markdown with protected LaTeX to HTML)
-                let html = parseMarkdownWithMath(text);
-                
-                previewContainer.innerHTML = html;
-                paperContainer.innerHTML = html;
-                
-                // Trigger KaTeX render
-                try {
-                    renderMathInElement(previewContainer, {
-                        delimiters: [
-                            {left: '$$', right: '$$', display: true},
-                            {left: '$', right: '$', display: false},
-                            {left: '\\(', right: '\\)', display: false},
-                            {left: '\\[', right: '\\]', display: true}
-                        ],
-                        throwOnError: false
-                    });
-                    renderMathInElement(paperContainer, {
-                        delimiters: [
-                            {left: '$$', right: '$$', display: true},
-                            {left: '$', right: '$', display: false},
-                            {left: '\\(', right: '\\)', display: false},
-                            {left: '\\[', right: '\\]', display: true}
-                        ],
-                        throwOnError: false
-                    });
-                    adaptChoicesGridLayout(previewContainer);
-                    adaptChoicesGridLayout(paperContainer);
-                } catch(e) {
-                    console.error('KaTeX rendering error: ', e);
-                }
+                const preparedHtml = renderQuestionPreviewContent(previewContainer, text);
+                renderQuestionPreviewContent(paperContainer, text, { preparedHtml: preparedHtml });
             };
 
             const updateAnswerPreview = () => {
@@ -2168,6 +2143,44 @@ let bankQuestionsRetryTimer = null;
             return window.MathBankSafe.sanitizeRichHtml(preprocessFormulaForKaTeX(text));
         }
         window.parseMarkdownWithMath = parseMarkdownWithMath;
+
+        function renderQuestionPreviewContent(container, text, options = {}) {
+            if (!container) return;
+            const settings = options && typeof options === 'object' ? options : {};
+            const includeImages = settings.includeImages !== false;
+            let preparedHtml;
+            if (typeof settings.preparedHtml === 'string') {
+                preparedHtml = window.MathBankSafe.sanitizeRichHtml(settings.preparedHtml);
+                if (!includeImages) {
+                    preparedHtml = preparedHtml.replace(/<img\b[^>]*>/gi, '');
+                }
+            } else {
+                let source = String(text || '');
+                if (!includeImages) {
+                    source = source
+                        .replace(/!\[[^\]\n]*\]\(\s*(?:<[^>\n]*>|[^\s)]+)(?:\s+(?:"[^"\n]*"|'[^'\n]*'))?\s*\)/gi, '')
+                        .replace(/<img\b[^>]*>/gi, '');
+                }
+                preparedHtml = parseMarkdownWithMath(source);
+            }
+            container.innerHTML = preparedHtml;
+            try {
+                renderMathInElement(container, {
+                    delimiters: [
+                        {left: '$$', right: '$$', display: true},
+                        {left: '$', right: '$', display: false},
+                        {left: '\\(', right: '\\)', display: false},
+                        {left: '\\[', right: '\\]', display: true}
+                    ],
+                    throwOnError: false
+                });
+            } catch (error) {
+                console.error('KaTeX question preview rendering error: ', error);
+            }
+            adaptChoicesGridLayout(container);
+            return preparedHtml;
+        }
+        window.renderQuestionPreviewContent = renderQuestionPreviewContent;
 
         // Format raw OCR questions by detecting choice options and introducing nice line breaks
         function formatQuestionContent(text) {

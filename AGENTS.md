@@ -63,6 +63,9 @@
 - **草稿箱与未保存决策流**：
   - 草稿统一存放在 LocalStorage 键 `mathbank_local_drafts`。离开未保存 Dirty 页面时提供“存入本地库/暂存草稿/离开/返回”决策流，入库后自动从草稿箱移除。
 - **题库列表分页契约**：`GET /api/questions` 不传 `page` 时保留历史数组响应；传入 `page` 后返回 `{items,total,page,page_size,total_pages}`，`page_size` 限制为 1–100，`sort` 仅支持 `asc` / `desc` 语义。侧栏必须使用分页响应，并以 `AbortController` 和请求序号保证最后一次请求胜出。
+- **入库前题目查重**：试卷 OCR/PDF/Word/TeX 识别、拆分和草稿编辑阶段不得自动查重；仅在用户点击单题【导入此题】、批量【导入选中题目】或普通编辑器保存时调用 `POST /api/questions/check-duplicates`。批量导入必须在任何一道题写库前完成整批预检，同时查批内与库内重复，确认后以最多 3 个并发任务逐题入库并保留部分成功语义。查重结果必须绑定 `parsedQuestionsGeneration`、客户题目标识及内容快照；题干、解析、题型或配图改变后旧结果立即失效。
+- **查重指纹与判定边界**：`question_fingerprints` 是 schema v6 引入、schema v7 将分桶索引扩展为 `(fingerprint_version, bandN, token_count)` 的可重建派生索引，指纹算法必须带 `fingerprint_version`。精确层使用保守规范化后的 SHA-256 普通索引（严禁 `UNIQUE`）；近似层使用 128-bit SimHash 拆成 8 个 16-bit 分桶索引召回有界候选，再对少量候选精排，不得全库逐题比较。schema v8 新增 8 个 `(fingerprint_version, text_bandN, token_count)` 文字片段索引：仅在精确/SimHash 候选精排后仍无需复核结果时启用，以 literal 与数字骨架 token 4-gram OPH 召回“多处小改+增删句子”题目；两阶段昂贵精排候选共享同一上限。规范化必须保留数字、变量、正负号、关系符、量词、定义域、区间开闭、选项及小问顺序；这些关键数学 token 不同时最高只能提示“可能是变式题”。数字骨架只能扩大候选召回，严禁影响 exact/critical 最终裁定。答案、解析、分类、难度、标签和来源不参与主指纹；答案差异只作为人工复核理由。可见配图按解码像素哈希提供证据，TikZ 按保守源码哈希提供证据；缺图、图不同或指纹不可用时必须标记配图待核对。
+- **查重写入与故障边界**：新建/更新题目时，`Question`、`QuestionCurriculum` 与当前版本指纹必须在同一 SQLite 事务内提交。已完成预检的请求携带 `duplicate_snapshot_hash`，写入前再复查精确指纹以关闭并发窗口；仅用户明确选择“仍作为独立题保存”时接受 `duplicate_override=independent`。查重只是可解释、可忽略的“疑似已收录”提示，严禁自动删除、自动合并或复用 `association_group_id`。查重接口/图像指纹失败时必须明示“查重暂不可用”并放行正常保存，不得伪装成“未发现重复”。旧题指纹只能在服务就绪、已完成必要备份后以小批次、可中断方式后台回填；索引未完成时 UI 必须显示覆盖率，不得声称已完整查重。
 - **数据库一致性与迁移**：SQLite 连接必须启用外键与 `busy_timeout`；本地可写文件系统优先使用经验证的 WAL，若底层不支持共享内存/WAL，则明确告警并降级为单机 `DELETE + synchronous=FULL`；WAL 与 DELETE 都无法启用时才拒绝启动。当前结构版本写入 `PRAGMA user_version`。任何结构迁移必须先生成独立、通过完整性检查且带 SHA-256 的快照，再在单事务中修复并迁移；未来版本数据库必须在任何建表、加列或建索引前拒绝启动。题目及关系写入应以一次数据库事务为成功边界，文件清理和 JSON 同步属于提交后的补偿操作，不得把已提交写入误报为失败。
 
 ### 3.2 解答与解析模块
@@ -141,9 +144,11 @@
 
 ### 3.12 可编辑 Word 试卷导出
 - **解耦与原生 OMML**：`mathbank.word_export_helper` 使用 python-docx 生成试卷结构，公式批量由 Pandoc 转为 Word 原生 OMML (`m:oMath`)，导出默认返回包含试卷正文与含答案解析两份文档的 `.zip` 打包。
+- **Pandoc 按需运行组件**：Word 导出前先复用通过启动校验的用户指定、MathBank 管理或系统 Pandoc；缺失时须由用户一次确认后，由 `mathbank.runtime_components` 按 Windows x64 / macOS arm64 / macOS x86_64 下载固定版本。下载顺序为 Pandoc 官方 GitHub Release 后 SourceForge 备用镜像，两者必须通过同一份固定 SHA-256、大小、安全解压、`pandoc --version` 与真实 OMML DOCX smoke 后才能原子安装到 `.system_generated/runtime/pandoc/`；安装完成后必须自动续接原 Word 导出，不得要求用户选路径、配 PATH 或重启服务。
 - **降级机制**：Pandoc 缺失或转换失败时调用 XeLaTeX 栅格化为 PNG 兜底，失败显示红色 `[公式待核对：...]`。
 - **字体与版面规范**：
   - 正文中文字体使用宋体 10.5pt，英文/数字使用 Times New Roman 10.5pt；主标题使用华文中宋，大题标题使用宋体 11pt 加粗。
+  - 填空题 `\fillin` 在 Word 中必须生成可编辑的本地下划线，默认宽度为 18 个不换行空格，不得将横线转为公式图片。
   - OMML 变量使用 Times New Roman 斜体（加 `m:nor` 保护），数字/运算符使用正体；严禁对所有数学 run 注入 `w:sz` 防止 WPS 显示异常。
   - 页面采用 A4，四边 2.54cm，正文使用至少 18pt 行距。
 

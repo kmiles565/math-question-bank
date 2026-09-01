@@ -160,6 +160,87 @@ for (const source of [
     assert result.returncode == 0, result.stderr
 
 
+def test_shared_question_preview_pipeline_renders_fillin_through_local_preprocessor():
+    editor_source = _read(STATIC_JS_DIR / "editor.js")
+    helper_start = editor_source.index("function transformFillinMacro(clean)")
+    helper_marker = "window.renderQuestionPreviewContent = renderQuestionPreviewContent;"
+    helper_end = editor_source.index(helper_marker, helper_start) + len(helper_marker)
+    helper_source = editor_source[helper_start:helper_end]
+
+    node = shutil.which("node")
+    assert node, "Node.js is required for the frontend executable regression"
+    script = r"""
+global.window = {
+  MathBankSafe: {
+    safeImageUrl(value) { return value; },
+    escapeAttribute(value) { return value; },
+    sanitizeRichHtml(value) { return value; },
+  },
+};
+let katexCalls = 0;
+let choicesCalls = 0;
+function renderMathInElement(container, options) {
+  katexCalls += 1;
+  const serialized = options.delimiters.map(item => `${item.left}:${item.right}:${item.display}`);
+  const expected = ['$$:$$:true', '$:$:false', '\\(:\\):false', '\\[:\\]:true'];
+  if (JSON.stringify(serialized) !== JSON.stringify(expected)) {
+    throw new Error(`unexpected KaTeX delimiters: ${JSON.stringify(serialized)}`);
+  }
+  if (options.throwOnError !== false) throw new Error('question preview must tolerate KaTeX errors');
+}
+function adaptChoicesGridLayout(container) {
+  choicesCalls += 1;
+  if (!container) throw new Error('choices layout received no container');
+}
+""" + helper_source + r"""
+const originalPreprocess = preprocessFormulaForKaTeX;
+let preprocessCalls = 0;
+preprocessFormulaForKaTeX = function(text) {
+  preprocessCalls += 1;
+  return originalPreprocess(text);
+};
+const container = { innerHTML: '' };
+const source = String.raw`填空：\fillin ![配图](/static/uploads/a.png) <img src="/static/uploads/b.png">`;
+const preparedHtml = window.renderQuestionPreviewContent(
+  container,
+  source,
+  { includeImages: false }
+);
+if (container.innerHTML.includes(String.raw`\fillin`)) {
+  throw new Error(`fillin macro leaked into shared preview: ${container.innerHTML}`);
+}
+if (!container.innerHTML.includes(String.raw`\underline{\hspace{1.5cm}}`)) {
+  throw new Error(`local fillin underline was not generated: ${container.innerHTML}`);
+}
+if (container.innerHTML.includes('<img') || container.innerHTML.includes('/static/uploads/')) {
+  throw new Error(`question images leaked into image-free preview: ${container.innerHTML}`);
+}
+const reusedContainer = { innerHTML: '' };
+const reusedHtml = window.renderQuestionPreviewContent(
+  reusedContainer,
+  String.raw`这段\fillin不应再预处理`,
+  { includeImages: false, preparedHtml: preparedHtml }
+);
+if (reusedHtml !== preparedHtml || reusedContainer.innerHTML !== preparedHtml) {
+  throw new Error('prepared question HTML was not reused exactly');
+}
+if (preprocessCalls !== 1) {
+  throw new Error(`preparedHtml path reran preprocessing: ${preprocessCalls}`);
+}
+if (katexCalls !== 2 || choicesCalls !== 2) {
+  throw new Error(`shared pipeline calls were incomplete: katex=${katexCalls}, choices=${choicesCalls}`);
+}
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_paper_preview_separates_choices_before_figure_layout():
     paper_source = _read(STATIC_JS_DIR / "paper.js")
     css_source = _read(CSS_PATH)
@@ -221,6 +302,7 @@ def test_static_dialogs_expose_modal_semantics_and_accessible_names():
         "updateModal": "updateModalTitle",
         "statsModal": "statsModalTitle",
         "latexImportModal": "latexImportModalTitle",
+        "parsedDuplicateReviewModal": "parsedDuplicateReviewTitle",
         "pdfCropModal": "pdfCropModalTitle",
         "answerTikzWorkbenchModal": "answerTikzWorkbenchTitle",
     }
@@ -247,6 +329,28 @@ def test_static_dialogs_expose_modal_semantics_and_accessible_names():
     assert workspace_button["aria-label"]
     for button_id in ("toggleSidebarBtn", "themeDropdownBtn", "darkModeBtn", "statsOpenBtn"):
         assert elements[button_id]["aria-label"]
+
+
+def test_duplicate_review_has_accessible_decision_controls_and_live_summary():
+    elements = _index_elements()
+    summary = elements["parsedDuplicateSummary"]
+    assert summary["role"] == "status"
+    assert summary["aria-live"] == "polite"
+    assert summary["aria-atomic"] == "true"
+
+    modal = elements["parsedDuplicateReviewModal"]
+    assert modal["aria-describedby"] == "parsedDuplicateReviewDescription"
+    for button_id in (
+        "duplicateReviewReturnBtn",
+        "duplicateReviewSkipBtn",
+        "duplicateReviewIndependentBtn",
+    ):
+        assert button_id in elements
+
+    import_source = _read(STATIC_JS_DIR / "import.js")
+    assert "window.MathBankModal.open(modal" in import_source
+    assert "onEscape: () => closeParsedDuplicateReviewModal('review')" in import_source
+    assert "badge.focus({ preventScroll: true })" in import_source
 
 
 def test_ai_classification_requires_manual_single_or_multi_choice_confirmation():
@@ -309,6 +413,21 @@ def test_modal_manager_traps_focus_handles_escape_and_restores_focus():
     assert import_source.count("window.MathBankModal.open") >= 3
     assert "window.MathBankModal.open(lightbox" in ocr_source
     assert "window.MathBankModal.open(modal" in paper_source
+
+
+def test_loading_saved_paper_restores_modal_background_interactivity():
+    paper_source = _read(STATIC_JS_DIR / "paper.js")
+
+    close_start = paper_source.index("window.closeSavedPapersModal = function ()")
+    close_end = paper_source.index("window.openSavedPapersModal = async function ()", close_start)
+    close_source = paper_source[close_start:close_end]
+    load_start = paper_source.index("window.loadSavedPaper = async function (paperId)")
+    load_end = paper_source.index("window.deleteSavedPaper = async function (paperId)", load_start)
+    load_source = paper_source[load_start:load_end]
+
+    assert close_source.index("window.MathBankModal.close(modal)") < close_source.index("modal.remove()")
+    assert "window.closeSavedPapersModal();" in load_source
+    assert "modal.remove()" not in load_source
 
 
 def test_mobile_layout_touch_targets_and_dialog_panes_have_regression_guards():
@@ -514,6 +633,30 @@ def test_sidebar_uses_server_pagination_and_latest_request_wins():
 
     assert "questions.sort(" not in load_source
     assert "questions.slice(" not in load_source
+
+
+def test_word_export_prepares_pandoc_once_and_can_continue_in_compatibility_mode():
+    index_source = _read(INDEX_PATH)
+    paper_source = _read(STATIC_JS_DIR / "paper.js")
+
+    for marker in (
+        'id="pandocInstallModal"',
+        '安装 Word 可编辑公式组件',
+        '安装并继续导出',
+        '本次兼容导出',
+        'id="pandocInstallProgressBar"',
+    ):
+        assert marker in index_source
+
+    for marker in (
+        "fetch('/api/runtime/pandoc/status')",
+        "fetch('/api/runtime/pandoc/install', { method: 'POST' })",
+        "pollPandocInstall(state.task_id)",
+        "await ensurePandocForWordExport()",
+        "await generateAndDownloadWord(payload)",
+        "decision === 'compatibility'",
+    ):
+        assert marker in paper_source
 
 
 def test_generated_tailwind_classes_use_configured_scales():

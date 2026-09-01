@@ -753,6 +753,7 @@ const values = {{
   editCompulsory: 'high_school',
   editChapter: 'chapter 1',
   editKnowledge: 'section 1',
+  editRelatedQuestion: '',
   editTags: 'saved tag'
 }};
 const elements = Object.fromEntries(
@@ -772,6 +773,7 @@ const requestSnapshot = Object.freeze({{
   category_compulsory: 'high_school',
   category_chapter: 'chapter 1',
   category_knowledge: 'section 1',
+  related_question_id: '',
   image_paths: JSON.stringify(['/static/uploads/saved.png']),
   tags: 'saved tag'
 }});
@@ -782,6 +784,10 @@ elements.editContent.value = 'request payload plus later input';
 if (!isEditorModified()) throw new Error('post-submit input was incorrectly marked saved');
 elements.editContent.value = 'request payload';
 if (isEditorModified()) throw new Error('restoring request snapshot should clear dirty state');
+elements.editRelatedQuestion.value = '23';
+if (!isEditorModified()) throw new Error('post-submit related-question change was incorrectly marked saved');
+elements.editRelatedQuestion.value = '';
+if (isEditorModified()) throw new Error('restoring related-question snapshot should clear dirty state');
 """
 
     result = subprocess.run(
@@ -883,6 +889,174 @@ def test_parsed_question_imports_use_question_identity_and_generation():
     assert "parsedQuestionSaveInFlight.delete(q)" in save_source
 
 
+def test_duplicate_checks_are_click_triggered_snapshot_bound_and_explicitly_overridden():
+    import_source = _read(STATIC_JS_DIR / "import.js")
+
+    render_start = import_source.index("function renderParsedQuestionsList(questions)")
+    render_end = import_source.index("function setupCardCategoryLinkage", render_start)
+    render_source = import_source[render_start:render_end]
+    assert "precheckParsedQuestionDuplicates" not in render_source
+    assert "scheduleParsedDuplicatePrecheck" not in import_source
+
+    request_start = import_source.index("async function requestQuestionDuplicateCheck(items)")
+    request_end = import_source.index("function duplicateBatchMatchCount", request_start)
+    request_source = import_source[request_start:request_end]
+    assert "'/api/questions/check-duplicates'" in request_source
+    assert "JSON.stringify({ items: items, max_candidates: 5 })" in request_source
+    assert "'X-Local-Token'" in request_source
+    assert "signal: controller.signal" in request_source
+    assert "isValidationError" in request_source
+
+    item_start = import_source.index("function buildParsedQuestionDuplicateItem")
+    item_end = import_source.index("function buildEditorQuestionDuplicateItem", item_start)
+    item_source = import_source[item_start:item_end]
+    for marker in (
+        "client_key",
+        "content:",
+        "answer_markdown:",
+        "question_type:",
+        "image_paths:",
+        "content_tikz_assets:",
+        "answer_tikz_assets:",
+        "tikz_code:",
+        "exclude_id:",
+    ):
+        assert marker in item_source
+    assert "exclude_id: null" in item_source
+
+    single_start = import_source.index("function saveParsedQuestion(index)")
+    single_end = import_source.index("function confirmClearAllParsed()", single_start)
+    single_source = import_source[single_start:single_end]
+    assert "indices: [index]" in single_source
+    assert single_source.index("precheckParsedQuestionDuplicates") < single_source.index(
+        "fetch('/api/questions'"
+    )
+    assert "serializeQuestionDuplicateItem(currentItem) !== expectedLocalSnapshot" in single_source
+    assert "formData.append('duplicate_snapshot_hash'" in single_source
+    assert "formData.append('duplicate_override', 'independent')" in single_source
+    assert "formData.append('content_tikz_assets'" in single_source
+    assert "formData.append('answer_tikz_assets'" in single_source
+    assert "if (outcome.invalid) return false" in single_source
+
+    batch_start = import_source.index("function saveAllParsedQuestions()")
+    batch_end = import_source.index("// SIDEBAR QUESTION SOURCE", batch_start)
+    batch_source = import_source[batch_start:batch_end]
+    assert batch_source.index("precheckParsedQuestionDuplicates") < batch_source.index(
+        "runParsedSavePool"
+    )
+    assert "openParsedDuplicateReviewModal(" in batch_source
+    assert "duplicateDecisionResolved: true" in batch_source
+    assert "selectedIndices.length > 500" in batch_source
+    assert "independentOverrideIndices.has(index)" in batch_source
+    assert "if (outcome.invalid) return false" in batch_source
+    assert ", 3);" in batch_source
+    assert "selectedIndices.map(idx => saveParsedQuestion" not in batch_source
+
+
+def test_bounded_parsed_import_pool_never_exceeds_three_workers_in_real_js():
+    node = shutil.which("node")
+    assert node, "Node.js is required for the frontend executable regression"
+    import_source = _read(STATIC_JS_DIR / "import.js")
+    pool_start = import_source.index("async function runParsedSavePool")
+    pool_end = import_source.index("function saveAllParsedQuestions()", pool_start)
+    pool_source = import_source[pool_start:pool_end]
+
+    script = f"""
+{pool_source}
+let active = 0;
+let peak = 0;
+(async () => {{
+  const values = Array.from({{ length: 20 }}, (_, index) => index);
+  const results = await runParsedSavePool(values, async value => {{
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 3));
+    active -= 1;
+    return value;
+  }}, 3);
+  if (peak > 3) throw new Error(`pool reached ${{peak}} concurrent workers`);
+  if (results.length !== values.length || results[19] !== 19) {{
+    throw new Error('pool lost result ordering or values');
+  }}
+}})().catch(error => {{ console.error(error); process.exitCode = 1; }});
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_shared_question_preview_pipeline_is_used_by_editor_and_duplicate_review():
+    editor_source = _read(STATIC_JS_DIR / "editor.js")
+    import_source = _read(STATIC_JS_DIR / "import.js")
+
+    helper_start = editor_source.index("function renderQuestionPreviewContent")
+    helper_end = editor_source.index(
+        "window.renderQuestionPreviewContent = renderQuestionPreviewContent;",
+        helper_start,
+    )
+    helper_source = editor_source[helper_start:helper_end]
+    parse_position = helper_source.index("preparedHtml = parseMarkdownWithMath(source)")
+    katex_position = helper_source.index("renderMathInElement(container")
+    choices_position = helper_source.index("adaptChoicesGridLayout(container)")
+    assert parse_position < katex_position < choices_position
+    assert "throwOnError: false" in helper_source
+    assert "settings.includeImages !== false" in helper_source
+    assert "typeof settings.preparedHtml === 'string'" in helper_source
+    assert "return preparedHtml" in helper_source
+    assert ".replace(/<img\\b[^>]*>/gi, '')" in helper_source
+    assert "window.renderQuestionPreviewContent = renderQuestionPreviewContent;" in editor_source
+
+    parse_start = editor_source.index("function parseMarkdownWithMath(text)")
+    parse_end = editor_source.index("window.parseMarkdownWithMath = parseMarkdownWithMath;", parse_start)
+    parse_source = editor_source[parse_start:parse_end]
+    assert "sanitizeRichHtml(preprocessFormulaForKaTeX(text))" in parse_source
+
+    update_start = editor_source.index("const updateContentPreview = () =>")
+    update_end = editor_source.index("const updateAnswerPreview = () =>", update_start)
+    update_source = editor_source[update_start:update_end]
+    assert "const preparedHtml = renderQuestionPreviewContent(previewContainer, text)" in update_source
+    assert "renderQuestionPreviewContent(paperContainer, text, { preparedHtml: preparedHtml })" in update_source
+    assert "renderMathInElement(" not in update_source
+
+    scheduler_start = import_source.index("function resetParsedDuplicateCandidateRendering")
+    candidate_start = import_source.index("function appendDuplicateCandidate")
+    scheduler_source = import_source[scheduler_start:candidate_start]
+    candidate_end = import_source.index("function renderParsedDuplicateReview", candidate_start)
+    candidate_source = import_source[candidate_start:candidate_end]
+    review_start = import_source.index("function renderParsedDuplicateReview", candidate_end)
+    review_end = import_source.index("function openParsedDuplicateReviewModal", review_start)
+    review_source = import_source[review_start:review_end]
+
+    assert "sanitizePlainText" in candidate_source
+    assert candidate_source.count("window.renderQuestionPreviewContent(") == 1
+    assert "scheduleParsedDuplicateCandidateRender(" in candidate_source
+    assert "new window.IntersectionObserver" in scheduler_source
+    assert "parsedDuplicateCandidateObserver.disconnect()" in scheduler_source
+    assert "parsedDuplicateCandidateObserver.observe(container)" in scheduler_source
+    assert "window.requestAnimationFrame" in scheduler_source
+    assert "{ includeImages: false }" in scheduler_source
+    assert "container.setAttribute('aria-busy', 'false')" in scheduler_source
+    assert "{ includeImages: false }" in candidate_source
+    assert "renderedContent.setAttribute('aria-busy', 'true')" in candidate_source
+    assert review_source.index("prepareParsedDuplicateCandidateRendering(list)") < review_source.index(
+        "list.textContent = ''"
+    )
+    assert "renderMathInElement(" not in candidate_source
+    assert "content.textContent" not in candidate_source
+    assert "plainContent" not in candidate_source
+    assert "点击加载并渲染完整题干" in candidate_source
+    assert "fetch(`/api/questions/${Number(candidate.id)}`)" in candidate_source
+    assert "reasonText.textContent" in candidate_source
+    assert ".innerHTML" not in candidate_source
+    assert "(?<=" not in import_source
+    assert "(?<!" not in import_source
+
+
 def test_parsed_save_generation_prevents_index_reuse_and_stale_callback_in_real_js():
     node = shutil.which("node")
     assert node, "Node.js is required for the frontend executable regression"
@@ -912,11 +1086,16 @@ const window = {{ MathBankSafe: {{ safeImageUrl(value) {{ return value; }} }} }}
 let parsedQuestionsData = [];
 let parsedQuestionsGeneration = 0;
 const parsedQuestionSaveInFlight = new Map();
+let parsedBatchSaveInFlight = null;
 const toasts = [];
 function showToast(message, type) {{ toasts.push([message, type]); }}
 function loadCategories() {{}}
 function loadQuestions() {{}}
 function updateSelectedCount() {{}}
+function validateParsedQuestionBeforeImport() {{ return true; }}
+function safeDuplicateTikzAssets() {{ return []; }}
+function safePersistedTikzAssets() {{ return []; }}
+function buildParsedQuestionDuplicateItem() {{ return {{ image_paths: [] }}; }}
 class FormData {{ append() {{}} }}
 
 function createCard(content) {{

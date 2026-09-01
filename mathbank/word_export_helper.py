@@ -29,6 +29,8 @@ from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import nsdecls, qn
 from docx.shared import Cm, Inches, Pt, RGBColor
 
+from mathbank.runtime_components import find_usable_pandoc
+
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -58,6 +60,7 @@ CJK_BODY_FONT = "SimSun"
 CJK_HEADING_FONT = "SimHei"
 CJK_TITLE_FONT = "STZhongsong"
 LATIN_FONT = "Times New Roman"
+WORD_FILLIN_BLANK_SPACES = 18
 STIX_TWO_MATH_PATHS = (
     Path("/System/Library/Fonts/Supplemental/STIXTwoMath.otf"),
     Path("/Library/Fonts/STIXTwoMath.otf"),
@@ -125,18 +128,8 @@ class PreparedQuestion:
 
 
 def _find_pandoc() -> str | None:
-    configured = os.getenv("MATHBANK_PANDOC_PATH", "").strip()
-    if configured and Path(configured).is_file():
-        return configured
-    found = shutil.which("pandoc")
-    if found:
-        return found
-    common = (
-        "/opt/homebrew/bin/pandoc",
-        "/usr/local/bin/pandoc",
-        r"C:\\Program Files\\Pandoc\\pandoc.exe",
-    )
-    return next((item for item in common if Path(item).is_file()), None)
+    resolved = find_usable_pandoc()
+    return os.fspath(resolved[0]) if resolved else None
 
 
 def _normalize_formula(formula: str) -> str:
@@ -645,7 +638,7 @@ class WordExamBuilder:
     def add_mixed(self, paragraph, text: str, size: float = BODY_FONT_SIZE) -> None:
         for token in tokenize_mixed_content(text):
             if isinstance(token, BlankToken):
-                run = paragraph.add_run("\u00a0" * 10)
+                run = paragraph.add_run("\u00a0" * WORD_FILLIN_BLANK_SPACES)
                 _set_run_font(run, size)
                 run.underline = True
                 continue

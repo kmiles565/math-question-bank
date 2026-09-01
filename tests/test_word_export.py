@@ -60,6 +60,42 @@ def test_tokenize_mixed_content_keeps_inline_and_display_math():
     assert [item.display for item in math_tokens] == [False, True]
 
 
+def test_word_fillin_uses_longer_native_underlined_blank(monkeypatch):
+    monkeypatch.setattr(
+        word_export_helper.PandocOmmlConverter,
+        "convert_many",
+        lambda self, formulas: {},
+    )
+    data, _ = build_word_document(
+        "填空线长度测试",
+        "",
+        "quiz",
+        [
+            {
+                "question": {
+                    "id": 1,
+                    "question_type": "fill_in_blank",
+                    "content": r"若 $x=1$，则结果为 \fillin。",
+                    "answer_markdown": "1",
+                    "image_paths": [],
+                },
+                "score": 5,
+            }
+        ],
+    )
+    document = etree.fromstring(_document_xml(data))
+    namespaces = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    }
+    underlined_text = document.xpath(
+        ".//w:r[w:rPr/w:u]/w:t/text()",
+        namespaces=namespaces,
+    )
+
+    assert "\u00a0" * word_export_helper.WORD_FILLIN_BLANK_SPACES in underlined_text
+    assert word_export_helper.WORD_FILLIN_BLANK_SPACES == 18
+
+
 @pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
 def test_word_export_uses_native_omml_when_pandoc_is_available():
     data, diagnostics = build_word_document(
@@ -340,6 +376,49 @@ def test_word_export_api_rejects_empty_paper(client):
     assert "卷面为空" in response.json()["message"]
 
 
+def test_pandoc_runtime_status_api_reports_existing_install(client, monkeypatch):
+    monkeypatch.setattr(
+        "main.pandoc_status",
+        lambda: {
+            "status": "ready",
+            "available": True,
+            "source": "system",
+            "version": "pandoc 3.test",
+            "path": "/test/pandoc",
+        },
+    )
+    monkeypatch.setattr(
+        "main.PANDOC_INSTALL_MANAGER.snapshot",
+        lambda: {"status": "idle", "task_id": None},
+    )
+
+    response = client.get("/api/runtime/pandoc/status")
+
+    assert response.status_code == 200
+    assert response.json()["pandoc"]["source"] == "system"
+    assert response.json()["pandoc"]["available"] is True
+
+
+def test_pandoc_runtime_install_api_requires_token_and_returns_task(client, monkeypatch):
+    state = {
+        "task_id": "pandoc-task",
+        "status": "queued",
+        "progress": 0,
+        "message": "queued",
+    }
+    monkeypatch.setattr("main.PANDOC_INSTALL_MANAGER.ensure", lambda: state)
+
+    forbidden = client.post("/api/runtime/pandoc/install")
+    accepted = client.post(
+        "/api/runtime/pandoc/install",
+        headers={"X-Local-Token": LOCAL_TOKEN},
+    )
+
+    assert forbidden.status_code == 403
+    assert accepted.status_code == 202
+    assert accepted.json()["pandoc"]["task_id"] == "pandoc-task"
+
+
 def test_word_export_title_block_matches_exam_layout():
     data, _ = build_word_document(
         "2026高中数学期末考试",
@@ -431,4 +510,3 @@ def test_create_word_bundle_zip():
         assert archive.namelist() == ["高一数学月考.docx", "高一数学月考_含答案与解析.docx"]
         assert archive.read("高一数学月考.docx") == main_bytes
         assert archive.read("高一数学月考_含答案与解析.docx") == ans_bytes
-
